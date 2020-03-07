@@ -10,6 +10,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.Serializable;
+import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
@@ -17,7 +18,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.function.Consumer;
 import java.util.function.Function;
 
 /**
@@ -63,7 +63,7 @@ public abstract class AbstractCacheTest {
 
         asyncTest();
 
-        penetrationProtectTest(cache);
+        penetrationProtectTestWrapper(cache);
     }
 
     private void illegalArgTest() {
@@ -113,7 +113,7 @@ public abstract class AbstractCacheTest {
         try {
             cache.unwrap(String.class);
             Assert.fail();
-        } catch (IllegalArgumentException e) {
+        } catch (Exception e) {
         }
 
         Assert.assertNull(cache.tryLock(null, 1, TimeUnit.SECONDS));
@@ -450,8 +450,9 @@ public abstract class AbstractCacheTest {
                             }
                         }
                     });
-            if (b)
+            if (b) {
                 runCount[0]++;
+            }
             countDownLatch.countDown();
         };
         for (int i = 0; i < count; i++) {
@@ -724,8 +725,20 @@ public abstract class AbstractCacheTest {
         Assert.assertFalse(cocurrentFail);
     }
 
+    private static void penetrationProtectTestWrapper(Cache cache) throws Exception {
+        boolean oldPenetrationProtect = cache.config().isCachePenetrationProtect();
+        Duration oldTime = cache.config().getPenetrationProtectTimeout();
+        cache.config().setCachePenetrationProtect(true);
+
+        penetrationProtectTest(cache);
+
+        cache.config().setCachePenetrationProtect(oldPenetrationProtect);
+        cache.config().setPenetrationProtectTimeout(oldTime);
+    }
+
     public static void penetrationProtectTest(Cache cache) throws Exception {
         boolean oldPenetrationProtect = cache.config().isCachePenetrationProtect();
+        Duration oldTime = cache.config().getPenetrationProtectTimeout();
         cache.config().setCachePenetrationProtect(true);
 
         penetrationProtectTestWithComputeIfAbsent(cache);
@@ -733,7 +746,12 @@ public abstract class AbstractCacheTest {
             penetrationProtectTestWithLoadingCache(cache);
         }
 
+        penetrationProtectReEntryTest(cache);
+
+        penetrationProtectTimeoutTest(cache);
+
         cache.config().setCachePenetrationProtect(oldPenetrationProtect);
+        cache.config().setPenetrationProtectTimeout(oldTime);
     }
 
     private static void penetrationProtectTestWithComputeIfAbsent(Cache cache) throws Exception {
@@ -747,18 +765,20 @@ public abstract class AbstractCacheTest {
             @Override
             public Object apply(Object k) {
                 try {
-                    Thread.sleep(50);
+                    Thread.sleep(100);
                 } catch (InterruptedException e) {
                     throw new RuntimeException(e);
                 }
                 if ((keyPrefix + "1").equals(k)) {
                     // fail 2 times
-                    if (count1.getAndIncrement() <= 1)
+                    if (count1.getAndIncrement() <= 1) {
                         throw new RuntimeException("mock error");
+                    }
                 } else if ((keyPrefix + "2").equals(k)) {
                     // fail 3 times
-                    if (count2.getAndIncrement() <= 2)
+                    if (count2.getAndIncrement() <= 2) {
                         throw new RuntimeException("mock error");
+                    }
                 }
                 loadSuccess.incrementAndGet();
                 return k + "_V";
@@ -868,5 +888,52 @@ public abstract class AbstractCacheTest {
         Assert.assertNull(failMsg[0]);
 
         cache.config().setLoader(oldLoader);
+    }
+
+    private static void penetrationProtectReEntryTest(Cache cache) {
+        Object v = cache.computeIfAbsent("penetrationProtectReEntryTest",
+                (k) -> cache.computeIfAbsent(k, (k2) -> "V"));
+        Assert.assertEquals("V", v);
+    }
+
+    private static void penetrationProtectTimeoutTest(Cache cache) throws Exception {
+        String keyPrefix = "penetrationProtectTimeoutTest_";
+        AtomicInteger loadSuccess = new AtomicInteger(0);
+        Function loader = k -> {
+            try {
+                Thread.sleep(75);
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+            }
+            loadSuccess.incrementAndGet();
+            return k + "_V";
+        };
+
+        cache.config().setPenetrationProtectTimeout(Duration.ofMillis(1));
+        Runnable runnable = () -> cache.computeIfAbsent(keyPrefix + 1, loader);
+        Thread t1 = new Thread(runnable);
+        Thread t2 = new Thread(runnable);
+        t1.start();
+        t2.start();
+        t1.join();
+        t2.join();
+        Assert.assertEquals(2, loadSuccess.intValue());
+
+        cache.config().setPenetrationProtectTimeout(Duration.ofMillis(200));
+        loadSuccess.set(0);
+        runnable = () -> cache.computeIfAbsent(keyPrefix + 2, loader);
+        t1 = new Thread(runnable);
+        t2 = new Thread(runnable);
+        Thread t3 = new Thread(runnable);
+        t1.start();
+        t2.start();
+        Thread.sleep(25);
+        t3.start();
+        Thread.sleep(25);
+        t3.interrupt();
+        t1.join();
+        t2.join();
+        t3.join();
+        Assert.assertEquals(2, loadSuccess.intValue());
     }
 }
